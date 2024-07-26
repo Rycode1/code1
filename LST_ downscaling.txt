@@ -1,0 +1,206 @@
+print(table)
+var roi = table.filter(ee.Filter.eq('city','guangzhou'))   // Fill in the research shp file path
+Map.centerObject(roi);
+Map.addLayer(roi, {'color':'grey'}, 'studyarea');
+var crs = 'EPSG:4326';
+var day_start = '2021-06-01';
+var day_end = '2021-09-01';
+
+// MODIS daily LST product (MOD11A1)1000m
+var MOD_LST = ee.ImageCollection('MODIS/006/MOD11A1')
+                  .filter(ee.Filter.date(day_start, day_end))
+                  .select(['LST_Day_1km'],['LST'])
+                  // .select(['LST_Night_1km'],['LST'])
+                  .map(function(img) {return img.multiply(0.02).subtract(273.15).clip(roi)});
+var MOD_LST = MOD_LST.select('LST').median();
+print("MOD_LST",MOD_LST);
+var LSTVisPara = {
+  min: 290.0,
+  max: 310.0,
+  palette: [
+    '040274', '040281', '0502a3', '0502b8', '0502ce', '0502e6',
+    '0602ff', '235cb1', '307ef3', '269db1', '30c8e2', '32d3ef',
+    '3be285', '3ff38f', '86e26f', '3ae237', 'b5e22e', 'd6e21f',
+    'fff705', 'ffd611', 'ffb613', 'ff8b13', 'ff6e08', 'ff500d',
+    'ff0000', 'de0101', 'c21301', 'a71001', '911003'
+  ],
+};
+Map.addLayer(MOD_LST, LSTVisPara,'MOD_LST',false);
+
+var MOD_SR1= ee.ImageCollection('MODIS/061/MOD09GA')
+                .filter(ee.Filter.date(day_start, day_end))
+                .select(['sur_refl_b01','sur_refl_b02','sur_refl_b03','sur_refl_b04','sur_refl_b05',],['red','NIR','BLUE','GREEN','MIR'])
+                .median();
+var img=MOD_SR1.clip(roi);
+var ndvi = img.normalizedDifference(['NIR','red']).rename("NDVI");
+var ndbi = img.normalizedDifference(['MIR','NIR']).rename("NDBI");
+var ndwi = img.normalizedDifference(['GREEN','NIR']).rename("NDWI");
+var mndwi=img.normalizedDifference(['GREEN','MIR']).rename("MNDWI");
+var evi = img.expression(  
+    '2.5 * ((NIR - red) / (NIR + 6 * red - 7.5 * BLUE + 1))', {  
+      'NIR': img.select('NIR'),  
+      'red': img.select('red'),  
+      'BLUE': img.select('BLUE')  
+}).float().rename('EVI'); 
+print(evi)
+print(ndwi)
+
+ var savi = img.expression(
+              '((NIR-red)*1.5)/(NIR+red+0.5)',{
+              red:img.select('red'),
+              NIR:img.select('NIR')
+            }).float().rename('SAVI'); 
+
+print(savi)
+var MOD_SR =img.addBands([ndvi,ndbi,ndwi,mndwi,evi,savi])
+var falseColorVis = {
+  min: -100.0,
+  max: 8000.0,
+  bands: ['NIR', 'NIR', 'red'],
+};
+Map.addLayer(MOD_SR, falseColorVis, 'MOD_SR',false);
+print(MOD_SR)
+
+// MODIS yearly land cover product (MCD12Q1) 500m
+var MOD_LULC = ee.ImageCollection('MODIS/006/MCD12Q1')
+                      .select(['LC_Type1'],['LULC'])
+                      .filter(ee.Filter.date('2021-01-01','2021-12-31'))
+                      .map(function(img) {return img.clip(roi)})
+                      .mean();
+
+var igbpLandCoverVis = {
+  min: 0.0,
+  max: 17.0,
+  palette: [
+    '05450a', '086a10', '54a708', '78d203', '009900', 'c6b044', 'dcd159',
+    'dade48', 'fbff13', 'b6ff05', '27ff87', 'c24f44', 'a5a5a5', 'ff6d4c',
+    '69fff8', 'f9ffa4', '1c0dff'
+  ],
+};
+Map.addLayer(MOD_LULC, igbpLandCoverVis, 'MOD_LULC',false);
+
+//  the Shuttle Radar Topography Mission (SRTM)90m
+var SRTM = ee.Image('CGIAR/SRTM90_V4').select('elevation').clip(roi);
+// Map.addLayer(SRTM, {min: 0, max: 300}, 'SRTM',false);
+
+var img_Original = MOD_LST.addBands(MOD_SR).addBands(MOD_LULC).addBands(SRTM);
+print("img_Original",img_Original);
+var img_240 = reSampleFun(img_Original,240);
+var img_960 = reSampleFun(img_Original,960);
+Map.addLayer(img_240.select("LST"), LSTVisPara,'img_240',false);
+Map.addLayer(img_960.select("LST"), LSTVisPara,'img_960',false);
+var MOD_LST=img_960.select("LST");
+var randomPoint = ee.FeatureCollection.randomPoints({
+  region:roi,
+  points:1000
+});
+Map.addLayer(randomPoint, {'color':'black'}, 'randomPoint');
+
+var SamplePointCol =  img_960.sampleRegions({
+  collection: randomPoint, 
+  scale: 100,
+  tileScale: 2,
+  geometries:true
+});
+print("SamplePointCol",SamplePointCol.limit(100));
+
+var classifierOfChoice = ee.Classifier.smileRandomForest(500).setOutputMode('REGRESSION');
+var propertyToPredictAsString = 'LST';
+print(propertyToPredictAsString)
+var bandFeature = ee.List(img_960.bandNames()).remove('LST');
+
+var trainedModel = classifierOfChoice.train({
+      features: SamplePointCol,
+      inputProperties: bandFeature,
+      classProperty: propertyToPredictAsString
+    });
+
+print(trainedModel)
+
+var LST960 = img_960.select(bandFeature)
+                   .classify(trainedModel)
+                   .rename('LST960').clip(roi);
+Map.addLayer(LST960.select("LST960"), LSTVisPara,'LST960',false); 
+print(LST960)
+var LSTError = img_960.select("LST").subtract(LST960.select("LST960"));
+// Smooth the image by convolving with the gaussian kernel.
+
+var gaussian = ee.Kernel.gaussian({
+    radius: 1.5, units: 'pixels'
+});
+
+var LSTError_240 = reSampleFun(LSTError,240).convolve(gaussian);
+
+var LST240 = img_240.select(bandFeature)
+                   .classify(trainedModel)
+                   .rename('LST240').clip(roi);
+Map.addLayer(LST240.select("LST240"), LSTVisPara,'LST240',false); 
+
+var LST240_corrected  = LST240.select("LST240").add(LSTError_240).rename("predicted");
+Map.addLayer(LST240_corrected, LSTVisPara,'LST240_corrected',false); 
+// resample image
+function reSampleFun(image,scale){
+  var dst_crs = image.select('blue').projection().crs();
+  var reSampleImg = image //.resample('bilinear') // bilinear bicubic
+                          .reproject({
+                            crs:'EPSG:4326', //
+                            scale:scale
+                          });
+  return reSampleImg;
+}
+
+// correlation analysis
+// Get predicted regression points in same location as training data
+var predictedTraining = LST240_corrected.addBands([LST960]).sampleRegions({
+  collection: randomPoint,
+  scale:100,
+  geometries: true,
+});
+
+// Separate the observed (REDOX_CM) and predicted (regression) properties
+var sampleTraining = predictedTraining.select(['LST960', 'predicted']);
+// Create chart, print it
+var chartTraining = ui.Chart.feature.byFeature({features:sampleTraining, xProperty:'LST960', yProperties:['predicted']})
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Predicted vs Observed - Training data ',
+    hAxis: {
+      'title': 'observed'
+    },
+    vAxis: {
+      'title': 'predicted'
+    },
+    pointSize: 3,
+    trendlines: {
+      0: {
+        showR2: true,
+        visibleInLegend: true
+      },
+      1: {
+        showR2: true,
+        visibleInLegend: true
+      }
+    }
+  });
+print(chartTraining);
+
+// Compute RMSE
+// Get array of observation and prediction values 
+var observationTraining = ee.Array(sampleTraining.aggregate_array('LST960'));
+var predictionTraining = ee.Array(sampleTraining.aggregate_array('predicted'));
+print('observationTraining', observationTraining)
+print('predictionTraining', predictionTraining)
+
+// Compute residuals
+var residualsTraining = observationTraining.subtract(predictionTraining);
+print('residualsTraining', residualsTraining)
+// Compute RMSE with equation, print it
+var rmseTraining = residualsTraining.pow(2)
+  .reduce('mean', [0])
+  .sqrt();
+print('Training RMSE', rmseTraining);
+
+
+
+
+
